@@ -4,6 +4,7 @@ import PIL
 import os
 import re
 import pickle
+import PIL.Image
 import numpy as np
 import hydra
 import open3d as o3d
@@ -37,6 +38,18 @@ import time
 import copy
 import sys
 import diffusers
+import argparse
+# Grounding DINO
+import GroundingDINO.groundingdino.datasets.transforms as T
+from GroundingDINO.groundingdino.models import build_model
+from GroundingDINO.groundingdino.util import box_ops
+from GroundingDINO.groundingdino.util.slconfig import SLConfig
+from GroundingDINO.groundingdino.util.utils import clean_state_dict, get_phrases_from_posmap
+
+# Segment Anything
+from segment_anything import build_sam, SamPredictor
+import cv2
+
 current_path = os.path.dirname(os.path.realpath(__file__))
 class GenAug():
     """A simple image dataset class."""
@@ -44,7 +57,7 @@ class GenAug():
     def __init__(self, rgb=None, depth=None, masks=None, camera=None, init_table=None, init_depth=None, init_table_mask=None):
         """A augmented RGB-D image dataset."""
         self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-2-inpainting",
+            "/nfsroot/DATA/IL_Research/wk/huggingface_model/stabilityai_stable_diffusion_2_inpainting",
             revision="fp16",
             torch_dtype=torch.float16,
         )
@@ -58,7 +71,7 @@ class GenAug():
 
         # stable diffusion depth2image
         self.depth2img_pipe = StableDiffusionDepth2ImgPipeline.from_pretrained(
-            "stabilityai/stable-diffusion-2-depth",
+            "/nfsroot/DATA/IL_Research/wk/huggingface_model/stable-diffusion-2-depth",
             torch_dtype=torch.float16,
         ).to("cuda")
         self.obj_bbox = []
@@ -469,15 +482,15 @@ class GenAug():
         return new_rgb, new_depth
 
 def prepare_mask(image):
-    num_obj = len(glob.glob(current_path + '/data/masks/*'))
+    num_obj = len(glob.glob(current_path + '/data/pip_test/*'))
     if num_obj>0:
         masks = []
         for i in range(num_obj):
-            mask = np.array(PIL.Image.open(current_path+'/data/masks/mask{}.png'.format(i+1)))
+            mask = np.array(PIL.Image.open(current_path+'/data/pip_test/mask_{}.png'.format(i)))
             masks.append(mask)
         return masks
 
-    mask = None
+    #mask = None
 
     def draw_polygon(event, x, y, flags, params):
         nonlocal mask
@@ -537,40 +550,186 @@ def camera_config(image_size, intrinsics, extrinsics):
     }
     return CONFIG
 
+def load_image(image_path):
+    # load image
+    image_pil = Image.open(image_path).convert("RGB")  # load image
 
+    transform = T.Compose(
+        [
+            T.RandomResize([800], max_size=1333),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    image, _ = transform(image_pil, None)  # 3, h, w
+    return image_pil, image
+
+def load_model(model_config_path, model_checkpoint_path, device):
+    args = SLConfig.fromfile(model_config_path)
+    args.device = device
+    model = build_model(args)
+    checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
+    load_res = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
+    print(load_res)
+    _ = model.eval()
+    return model
+
+def get_grounding_output(model, image, caption, box_threshold, text_threshold, with_logits=True, device="cpu"):
+    caption = caption.lower()
+    caption = caption.strip()
+    if not caption.endswith("."):
+        caption = caption + "."
+    model = model.to(device)
+    image = image.to(device)
+    with torch.no_grad():
+        outputs = model(image[None], captions=[caption])
+    logits = outputs["pred_logits"].cpu().sigmoid()[0]  # (nq, 256)
+    boxes = outputs["pred_boxes"].cpu()[0]  # (nq, 4)
+    logits.shape[0]
+
+    # filter output
+    logits_filt = logits.clone()
+    boxes_filt = boxes.clone()
+    filt_mask = logits_filt.max(dim=1)[0] > box_threshold
+    logits_filt = logits_filt[filt_mask]  # num_filt, 256
+    boxes_filt = boxes_filt[filt_mask]  # num_filt, 4
+    logits_filt.shape[0]
+
+    # get phrase
+    tokenlizer = model.tokenizer
+    tokenized = tokenlizer(caption)
+    # build pred
+    pred_phrases = []
+    for logit, box in zip(logits_filt, boxes_filt):
+        pred_phrase = get_phrases_from_posmap(logit > text_threshold, tokenized, tokenlizer)
+        if with_logits:
+            pred_phrases.append(pred_phrase + f"({str(logit.max().item())[:4]})")
+        else:
+            pred_phrases.append(pred_phrase)
+
+    return boxes_filt, pred_phrases
+
+# basic config
+config_file = "/nfsroot/DATA/IL_Research/will/multiview_dataaug/models/huggingface_model/GroundingDINO/GroundingDINO_SwinT_OGC.py"
+grounded_checkpoint = "/nfsroot/DATA/IL_Research/will/multiview_dataaug/models/huggingface_model/GroundingDINO/groundingdino_swint_ogc.pth"
+sam_checkpoint = "/nfsroot/DATA/IL_Research/will/multiview_dataaug/models/huggingface_model/SAM/sam_vit_h_4b8939.pth"
 
 
 if __name__ == '__main__':
 
-    intrinsics = np.array([[386.72210693359375, 0, 323.0413513183594], [0, 386.17559814453125, 242.57159423828125], [0, 0, 1]])
-    extrinsics = np.array([[-0.99873792, 0.00936523, 0.04934428, 0.54809884],
-                         [-0.03053219, 0.66687277, -0.7445458, 0.71942106],
-                         [-0.0398792, -0.74511275, -0.66574518, 0.4798353],
-                           [0,0,0,1]])
+    parser = argparse.ArgumentParser(description="Process some images and generate augmented versions.")
+    parser.add_argument('--input', type=str, required=True, help='Path to the input directory')
+    parser.add_argument('--output', type=str, required=True, help='Path to the output directory')
+    parser.add_argument("--item", type=str, required=True, help="object to replace, supported: robot arm and you need")
+    parser.add_argument("--camera", type=str, required=True, help="choose camera to adjust parameter")
 
-    image = PIL.Image.open("data/label_0.png")
-    image_size = (np.array(image).shape[0], np.array(image).shape[1])
-    camera = camera_config(image_size, intrinsics, extrinsics)
-    ######################### prepare the segmentation masks of objects ##########################
-    # [left mouse]: add a new point | [right mouse]: finish | [space]: reset | [esc]: exit
-    masks = prepare_mask(cv2.cvtColor(np.array(image), cv2.COLOR_BGR2RGB))
-    ##############################################################################################
+    args = parser.parse_args()
+    input_path = args.input
+    base_output_path = args.output
+    item = args.item
+    camera_name = args.camera
+    
+    if camera_name == 'camera_left':
+        intrinsics = np.array([[608.4066162109375, 0.0, 318.0715637207031], [0.0, 608.3114624023438, 256.1876220703125], [0, 0, 1]])
+        extrinsics = np.array([[-0.90296094, -0.21165836,  0.37398166,  0.31437289],
+                            [-0.42258445,  0.59532919, -0.68337804,  1.02081076],
+                            [-0.07799952, -0.77510251, -0.62700254,  0.85824058],
+                            [0,0,0,1]])
 
-    data = pickle.load(open('data/label_0.pkl', 'rb'))
-    depth = data['depth'] / 1000
+    elif camera_name == 'camera_right':
+        intrinsics = np.array([[609.1039428710938, 0.0, 328.1182556152344], [0.0, 608.821533203125, 247.01058959960938], [0, 0, 1]])
+        extrinsics = np.array([[0.49095751, -0.55381806,  0.67249259, -0.01004508],
+                            [-0.86493439, -0.21757396,  0.45227212, -0.60783651],
+                            [-0.10415959, -0.80370836, -0.58583586,  0.89650023],
+                            [0,0,0,1]])
+        
+    else:
+        intrinsics = np.array([[909.6201171875, 0.0, 635.703125], [0.0, 908.7317504882812, 364.509368896844], [0, 0, 1]])
+        extrinsics = np.array([[-0.04640444,  0.91275018, -0.40587405,  1.05325108],
+                            [0.99843405,  0.0550883 ,  0.0097323 ,  0.11058065],
+                            [0.03124207, -0.40478685, -0.9138772 ,  0.98161176],
+                            [0,0,0,1]])
+    
+     # make dirs for output
+    os.makedirs(base_output_path, exist_ok=True)
+    if not os.path.isdir(input_path):
+        print("Input path error! Please check your input.")
 
-    init_color = np.load("data/empty_color.npy")
-    init_depth = np.load("data/empty_depth.npy") / 1000
-    init_mask = np.array(PIL.Image.open("data/empty_table.png"))[:, :, 0]
-    init_mask[init_mask > 230] = 255
-    init_mask[init_mask != 255] = 0
-    init_color[init_mask != 255] = 255
+    device = "cuda"
+    torch.cuda.empty_cache()
+    ####### init GroundingDINO and SAM
+    grounded_model = load_model(config_file, grounded_checkpoint, device)
+    predictor = SamPredictor(build_sam(checkpoint=sam_checkpoint).to(device))
 
-    genaug = GenAug(rgb=image, depth=depth, masks=masks, camera=camera)
+    # for run in range(100):
+    #     output_path = os.path.join(base_output_path, f"run_{run + 1}")
+    #     os.makedirs(output_path, exist_ok=True)
+        
+    for image_name in os.listdir(input_path):
+        image_path = os.path.join(input_path, image_name)
+        if os.path.exists(os.path.join(base_output_path, image_name)):
+            continue
+        if not (os.path.isfile(image_path) and any(image_path.lower().endswith(ext) for ext in [".jpg", ".png"])):
+            continue
+        
+        if image_name.find('depth') >= 0:
+            continue
+        print(f"processing: {image_path}")
 
-    # for num_aug in range(100):
-    new_rgb, new_depth = genaug.augmentation(obj_names=['a small paper box', 'basket'], object=False, distractors=False) #default: texture=True, object=False, distractors=True, background=True, table=True
-    # PIL.Image.fromarray(new_rgb).save("/home/zoeyc/Downloads/outdoor2_{}aug.jpg".format(num_aug))
-    PIL.Image.fromarray(new_rgb).show()
+        image_pil, image = load_image(image_path)
 
-    visualize_rgb_pc(new_rgb, new_depth, camera['intrinsics'], camera['extrinsics'])
+        det_prompt = item.lower()
+        #print(det_prompt)
+        box_threshold = 0.3
+        text_threshold = 0.25
+        boxes_filt, pred_phrases = get_grounding_output(
+                grounded_model, image, det_prompt, box_threshold,
+                text_threshold, device=device)
+        
+        image = cv2.imread(image_path)
+        sam_image = image.copy()
+        predictor.set_image(sam_image)
+
+        size = image_pil.size
+        H, W = size[1], size[0]
+        for i in range(boxes_filt.size(0)):
+            boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
+            boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
+            boxes_filt[i][2:] += boxes_filt[i][:2]
+
+        boxes_filt = boxes_filt.cpu()
+        transformed_boxes = predictor.transform.apply_boxes_torch(
+            boxes_filt, image.shape[:2]).to(device)
+
+        masks, _, _ = predictor.predict_torch(
+            point_coords=None,
+            point_labels=None,
+            boxes=transformed_boxes.to(device),
+            multimask_output=True,
+        )
+        mask_set = []
+        for i, mask in enumerate(masks):
+            # mask_numpy = mask[0].cpu().numpy()
+            # mask_pil = Image.fromarray((mask_numpy * 255).astype(np.uint8))  # 将mask转换为PIL图像
+            # mask_filename = os.path.join(test_dir, f"mask_{i}.png")
+            # mask_pil.save(mask_filename)
+            mask_numpy = (mask[0].cpu().numpy() * 255).astype(np.uint8) 
+            mask_set.append(mask_numpy)
+            
+        depth_path = image_path.replace(".jpg", ".npy").replace("rgb_", "")
+        if not os.path.isfile(depth_path):
+            print(f"Depth file not found:{depth_path}")
+            continue  
+
+        depth = np.load(depth_path) / 1000 
+
+        image = PIL.Image.open(image_path)
+        image_size = (np.array(image).shape[0], np.array(image).shape[1])
+        camera = camera_config(image_size, intrinsics, extrinsics)
+
+        #masks = prepare_mask(cv2.cvtColor(np.array(image), cv2.COLOR_BGR2RGB))
+        
+        genaug = GenAug(rgb=image, depth=depth, masks=mask_set, camera=camera)
+        obj_names = [name.strip() for name in item.split(',')]
+        new_rgb, new_depth = genaug.augmentation(obj_names=obj_names, object=False, distractors=False, texture=False)
+        PIL.Image.fromarray(new_rgb).save(os.path.join(base_output_path, "aug_"+ image_name))
