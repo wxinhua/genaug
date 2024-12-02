@@ -27,7 +27,7 @@ pip install -r requirements.txt
 
 输出增强后的h5文件
 ```bash
-bash back2h5.sh
+bash back2h5.sh input_path(~/success_episodes) output_path file_number(xxxxxx) augment_time item 
 ```
 
 
