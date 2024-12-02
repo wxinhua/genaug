@@ -2,11 +2,11 @@
 
 export TRANSFORMERS_CACHE=/nfsroot/DATA/IL_Research/wk/huggingface_model
 # 基础输入路径和输出路径（请根据实际情况设置）
-base_input_path="/nfsroot/DATA/IL_Research/datasets/dual_franka/real_franka_1/h5_data/241015_stack_blue_cube_on_pink_1/success_episodes"
-base_output_path="/nfsroot/DATA/IL_Research/will/datasets/aug_franka_h5_data/241015_stack_blue_cube_on_pink_1/success_episodes"
+base_input_path="$1" #"/nfsroot/DATA/IL_Research/datasets/dual_franka/real_franka_1/h5_data/241015_stack_blue_cube_on_pink_1/success_episodes"
+base_output_path="$2" #"/nfsroot/DATA/IL_Research/will/datasets/aug_franka_h5_data/241015_stack_blue_cube_on_pink_1/success_episodes"
 
 # 找到所有符合条件的目录，并按数字顺序排序
-all_trajectory_dirs=($(find "$base_input_path" -maxdepth 1 -type d | grep -E '/1015_' | sort -t '_' -k 2 -n))
+all_trajectory_dirs=($(find "$base_input_path" -maxdepth 1 -type d | grep -E '/'$3'_' | sort -t '_' -k 2 -n))
 
 # 确保至少有100条轨迹
 if [ ${#all_trajectory_dirs[@]} -lt 50 ]; then
@@ -15,21 +15,23 @@ if [ ${#all_trajectory_dirs[@]} -lt 50 ]; then
 fi
 
 # 从 all_trajectory_dirs 中提取前25个元素作为固定的列表
-trajectory_dirs=("${all_trajectory_dirs[@]:0:25}")
+# trajectory_dirs=("${all_trajectory_dirs[@]:0:25}")
 
 # echo "The first 25 trajectory directories are:"
 # for dir in "${trajectory_dirs[@]}"; do
 #     echo "$dir"
 # done
 
-# 循环10次
-for run in {1..3}; do
-    for input_dir in "${trajectory_dirs[@]}"; do
+# 循环n次
+run_time="$4"
+for run in $run_time; do
+    for input_dir in "${all_trajectory_dirs[@]}"; do
+        echo "$input_dir"
         # 提取出时间戳部分
         timestamp=$(basename "$input_dir")
         
         # 定义要处理的相机列表
-        cameras=("camera_left""camera_right" "camera_top" )
+        cameras=("camera_left" "camera_right" "camera_top" )
 
         # 处理每个相机方向
         for camera in "${cameras[@]}"; do
@@ -51,7 +53,7 @@ for run in {1..3}; do
             CUDA_VISIBLE_DEVICES=1 python genaug_h5.py \
                 --input "$full_input_path" \
                 --output "$full_output_path" \
-                --item "robot arm, cube" \
+                --item "$5" \
                 --camera "$camera" \
                 --groundingdino_config "/nfsroot/DATA/IL_Research/will/multiview_dataaug/models/huggingface_model/GroundingDINO/GroundingDINO_SwinT_OGC.py"\
                 --grounded_checkpoint "/nfsroot/DATA/IL_Research/will/multiview_dataaug/models/huggingface_model/GroundingDINO/groundingdino_swint_ogc.pth"\

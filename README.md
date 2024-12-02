@@ -8,6 +8,12 @@ git clone https://github.com/wxinhua/genaug.git
 ```
 Install required packages:
 ```bash
+conda create -n Genaug python=3.10
+conda activate Genaug
+cd genaug
+pip install torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121
+python -m pip install -e segment_anything
+pip install --no-build-isolation -e GroundingDINO
 pip install -r requirements.txt
 ```
 需要的模型有：
